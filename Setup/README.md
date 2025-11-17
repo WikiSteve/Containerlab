@@ -1,206 +1,278 @@
-## Part 0. Pre flight sanity check
+# Containerlab “Zero to Ping” Setup Guide
 
-Run:
+This guide takes you from a bare VM to a working Containerlab environment with Nokia and Arista images ready to use. It focuses on infrastructure only. No routing, no BGP, just getting the lab platform stable.
+
+## 1. Host VM prerequisites
+
+Don’t starve your VM. If you try to run this on default tiny settings, things will crash in ways that look “mysterious” but are just resource limits.
+
+### 1.1 RAM
+
+Set your VM to **8 GB RAM** or more.
+
+2 GB is not enough for:
+
+* Linux
+* Docker
+* Containerlab
+* Multiple NOS containers
+
+### 1.2 Disk space
+
+Docker is greedy in two different places:
+
+* You download NOS images into **your home directory** (usually on `/home`).
+* When you import them, Docker expands and stores them under **`/var/lib/docker` on `/`**.
+
+If you gave most of your disk to `/home` and left `/` tiny, you can end up in this situation:
+
+* The download to `/home` works.
+* The `docker import` fails because `/` runs out of space while unpacking.
+
+You need **several gigabytes free in both**:
+
+* `/home` for the raw downloaded files
+* `/` for Docker’s internal image storage
+
+Quick checks:
 
 ```bash
-uname -m
-free -h
 df -h /
-````
-
-If:
-
-* `uname -m` is not `x86_64`, or
-* `/` has almost no free space
-
-then either use a fresh VM or fix storage using your storage / LVM lab.
-
-Create a notes file:
-
-```bash
-nano clab-notes.txt
+df -h /home
 ```
 
-Record:
+If either of those has only a couple of gigabytes free, fix it now.
+Do not soldier on and then blame Containerlab when imports fail halfway.
 
-* Architecture from `uname -m`
-* Free space on `/` from `df -h /`
+Typical fix (high level):
 
-Save the file.
+1. Shut down the VM.
+2. Add a new virtual disk in your hypervisor (for example 40 GB).
+3. Boot the VM.
+4. Use LVM to:
 
-## Part 1. Check Containerlab and Docker
+   * Create a new physical volume on the new disk.
+   * Extend your existing volume group with it.
+   * Extend the logical volume that backs `/`.
+   * Optionally extend `/home` too if that is also tight.
+   * Grow the filesystem.
 
-### 1.1 Containerlab version
+You can document the exact LVM commands separately as an **“LVM Emergency Expansion”** cheat sheet.
 
-Run:
+---
+
+## 2. Install core tools
+
+We are not using nested virtualization. We are running **containers** on top of the Linux host (using cgroups and namespaces) instead of spinning VMs inside VMs.
+
+You need two main tools:
+
+* Docker (container engine)
+* Containerlab (topology orchestrator)
+
+### 2.1 Install Docker
+
+On a Debian or Ubuntu style system:
+
+```bash
+sudo apt update
+sudo apt install docker.io
+```
+
+Then verify:
+
+```bash
+docker version
+sudo systemctl status docker
+```
+
+Make sure Docker is **active (running)**.
+
+### 2.2 Install Containerlab
+
+Use the official install script:
+
+```bash
+bash -c "$(curl -sL https://get.containerlab.dev)"
+```
+
+If you care about security, read the script before running it.
+
+Verify:
 
 ```bash
 containerlab version
 ```
 
-If you get a version string, you are fine.
+If that prints a version string, the install worked.
 
-If you get `command not found`, reinstall Containerlab the way you did in class.
+---
 
-Add the exact version string to `clab-notes.txt`.
+## 3. Get the Arista cEOS image
 
-### 1.2 Docker status
+Nokia SR Linux images can be pulled automatically from a registry. Arista cEOS usually needs a manual download and import.
 
-Check Docker:
+### 3.1 Register on Arista’s portal
+
+1. Go to the Arista software download page.
+2. Create an account with a valid email.
+3. Log in and locate the **cEOS-lab** image. You want **cEOS-lab** (container), not vEOS (VM).
+
+### 3.2 Download the correct image
+
+When you pick the file:
+
+* Choose the **64 bit** build for your platform.
+* Pay attention to the filename. Sometimes it ends up with odd extensions like `.tar.tar`.
+
+If the filename looks wrong:
 
 ```bash
-sudo systemctl status docker
+ls
+file cEOS*.tar*
 ```
 
-If it is not active, start it:
+If `file` says it is an `XZ compressed` archive but the name is weird, fix it:
 
 ```bash
-sudo systemctl start docker
+mv cEOS64-lab-4.32.0F.tar.tar cEOS64-lab-4.32.0F.tar.xz
 ```
 
-Then:
+Adjust names to match your actual file.
+
+Make sure you have:
+
+* Enough free space on `/home` for the downloaded file
+* Enough free space on `/` for Docker to unpack it
+
+### 3.3 Import cEOS into Docker
+
+From the directory where the file lives:
 
 ```bash
-docker ps
+docker import cEOS64-lab-4.32.0F.tar.xz ceos:4.32.0F
 ```
 
-It is ok if nothing is running yet.
+Replace `4.32.0F` with whatever version you downloaded. The part after the space (`ceos:4.32.0F`) is the **repository:tag** you will use in your Containerlab YAML.
 
-In `clab-notes.txt` note whether Docker was already running or you had to start it.
-
-## Part 2. Check Nokia and Arista images
-
-List Docker images:
+Check:
 
 ```bash
-docker images
-```
-
-Filter if the list is long:
-
-```bash
-docker images | grep -i srl
 docker images | grep -i ceos
 ```
 
-You are looking for something like:
+You should see something like:
 
-* Nokia SR Linux image, for example: `ghcr.io/nokia/srlinux   <tag>`
-* Arista cEOS image, for example: `ceos   4.35`
-
-In `clab-notes.txt` record:
-
-* Nokia image repository and tag
-* Arista image repository and tag
-
-If either image is missing, re import it before continuing.
-
-## Part 3. Create the Containerlab topology
-
-You will build a two node lab:
-
-* `nokia1` runs SR Linux (SSH access)
-* `ceos1` runs cEOS (CLI via Docker)
-
-### 3.1 Working directory
-
-```bash
-mkdir -p ~/clab/week11-recap
-cd ~/clab/week11-recap
+```text
+ceos   4.32.0F   <image-id>   ...
 ```
 
-### 3.2 Topology file
+---
 
-Create `week11-recap.clab.yaml`:
+## 4. Define the topology
+
+Create a minimal Containerlab topology file that uses Nokia and Arista together.
+
+### 4.1 Create a working directory
 
 ```bash
-nano week11-recap.clab.yaml
+mkdir -p ~/clab/zero-to-ping
+cd ~/clab/zero-to-ping
 ```
 
-Paste this, then edit the `image:` lines to match what you saw in Part 2:
+### 4.2 Create `clab.yaml`
+
+Open the file:
+
+```bash
+nano clab.yaml
+```
+
+Example minimal topology:
 
 ```yaml
-name: week11-recap
+name: zero-to-ping
 
 topology:
   nodes:
     nokia1:
       kind: srl
-      image: ghcr.io/nokia/srlinux:latest    # change to your exact Nokia image:tag
+      image: ghcr.io/nokia/srlinux:latest   # or the exact tag you want
     ceos1:
       kind: ceos
-      image: ceos:4.35                       # change to your exact cEOS tag
+      image: ceos:4.32.0F                   # must match your docker import tag
 ```
 
-Save and exit.
+Two key gotchas:
 
-Key points:
+* **Version trap:** Docs might show `ceos:4.32`. Your imported tag might be `ceos:4.32.0F` or `ceos:4.35.0F`. The tag in `image:` must match exactly.
+* **Image names:** The Nokia image string (`ghcr.io/nokia/srlinux:latest`) must be something Docker can pull. If you use a different tag, adjust it.
 
-* `kind: srl` tells Containerlab this is a Nokia SR Linux node
-* `kind: ceos` tells it this is an Arista cEOS node
-* `image:` must match a Docker image you already have
+Save the file.
 
-## Part 4. Deploy the lab
+---
+
+## 5. Deploy and verify
+
+### 5.1 Deploy the lab
 
 From the same directory:
 
 ```bash
-cd ~/clab/week11-recap
-containerlab deploy -t week11-recap.clab.yaml
+containerlab deploy --topo clab.yaml
 ```
 
 You should see Containerlab:
 
-* Resolving images
-* Creating `nokia1` and `ceos1`
-* Finishing without errors
+* Pull or reuse the Nokia and Arista images
+* Create two nodes (`nokia1` and `ceos1`)
+* Report success at the end
 
-Confirm containers:
+If you get “image not found” errors, check:
+
+* The output of `docker images`
+* The `image:` lines in `clab.yaml`
+
+They must match.
+
+### 5.2 Verify with Docker
+
+List running containers:
 
 ```bash
 docker ps
 ```
 
-You should see containers with names like:
+You should see containers named something like:
 
-* `clab-week11-recap-nokia1`
-* `clab-week11-recap-ceos1`
+* `clab-zero-to-ping-nokia1`
+* `clab-zero-to-ping-ceos1`
 
-Record the exact names in `clab-notes.txt`.
+If they are up, the infrastructure side is working.
 
-## Part 5. SSH into Nokia
+---
 
-### 5.1 Find the management IP
+## 6. Access the nodes
 
-Use `inspect`:
+### 6.1 Nokia (SSH)
 
-```bash
-containerlab inspect -t week11-recap.clab.yaml
-```
-
-Look for the `mgmt` section for `nokia1`. You should see an IPv4 address, for example `172.20.20.5`.
-
-Quick filter option:
+Find the management IP:
 
 ```bash
-containerlab inspect -t week11-recap.clab.yaml | grep -A4 nokia1
+containerlab inspect --topo clab.yaml | grep -A4 nokia1
 ```
 
-Record the IPv4 address of `nokia1` in `clab-notes.txt`.
+Look for an `IPv4` address in the `mgmt` section.
 
-### 5.2 SSH to the node
-
-From the host VM:
+SSH in:
 
 ```bash
 ssh admin@<NOKIA_MGMT_IP>
 ```
 
-Replace `<NOKIA_MGMT_IP>` with the address from 5.1.
+Replace `<NOKIA_MGMT_IP>` with the address you found. Use the credentials for your SR Linux demo image.
 
-Use the credentials configured for your SR Linux image.
-
-Once logged in, run for example:
+Once in, try:
 
 ```text
 info
@@ -208,38 +280,27 @@ show interface brief
 exit
 ```
 
-In `clab-notes.txt` write:
+If that works, Nokia is good.
 
-* The IP address used
-* Confirmation that `info` and `show interface brief` worked
+### 6.2 Arista (Docker exec + CLI)
 
-## Part 6. Enter Arista CLI using Docker
+For Arista cEOS, access is via Docker plus the Arista CLI process.
 
-For Arista, you attach to the container and run the CLI process.
-
-### 6.1 Attach to the container
-
-Confirm the name:
+Attach:
 
 ```bash
-docker ps
-```
-
-Then:
-
-```bash
-docker exec -it clab-week11-recap-ceos1 Cli
+docker exec -it clab-zero-to-ping-ceos1 Cli
 ```
 
 Adjust the container name if yours differs.
 
-You should land at a cEOS prompt, something like:
+You should see an EOS prompt like:
 
 ```text
 localhost>
 ```
 
-Run a few commands:
+Try:
 
 ```text
 show version
@@ -249,50 +310,31 @@ show running-config | section hostname
 exit
 ```
 
-If `Cli` fails, drop into the shell then run `Cli`:
+If `Cli` is not found, drop into the shell and run it there:
 
 ```bash
-docker exec -it clab-week11-recap-ceos1 bash
+docker exec -it clab-zero-to-ping-ceos1 bash
 Cli
 ```
 
-In `clab-notes.txt` record:
+At this point, you have:
 
-* The prompt you saw
-* One thing that looked familiar from Cisco IOS
+* Nokia accessible over SSH
+* Arista accessible via Docker exec and CLI
 
-## Part 7. Destroy the lab
+That is enough for the “Zero to Ping” foundation.
 
-From `~/clab/week11-recap`:
+---
+
+## 7. Cleanup
+
+When you are done:
 
 ```bash
-containerlab destroy -t week11-recap.clab.yaml
+containerlab destroy --topo clab.yaml
 docker ps
 ```
 
-The `clab-week11-recap-*` containers should be gone.
+The `clab-zero-to-ping-*` containers should be gone.
 
-Add a short note to `clab-notes.txt`:
-
-* One or two sentences on why the pattern `deploy → work → destroy` is safer than leaving labs running
-
-## Deliverables
-
-Submit:
-
-1. `week11-recap.clab.yaml`
-2. `clab-notes.txt` containing:
-
-   * Architecture and free space from Part 0
-   * Containerlab version
-   * Docker status (running or started)
-   * Nokia and Arista image names and tags
-   * Container names from `docker ps`
-   * Nokia management IP and SSH confirmation
-   * Arista CLI prompt and one familiar feature
-   * Final “why we destroy labs” note
-
-```
-
-ex=0}
-```
+This `deploy → test → destroy` pattern keeps your VM clean and makes later labs reproducible. Leaving stray labs running is a good way to burn RAM and then hit week 13 problems caused by ghosts from week 10.
